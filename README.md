@@ -1,6 +1,6 @@
 # Faucet Deployer
 
-#### AMM Faucet: Deployment Guide and Technical Documentation
+### AMM Faucet: Deployment Guide and Technical Documentation
 
 ## Introduction
 
