@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+import "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+
+// Interface for the Oracle contract
+interface IOracle {
+    function getPrice(address tokenAddress) external view returns (uint256);
+}
+
+contract AMMFaucet is ERC20, ReentrancyGuard, Ownable, Pausable, Initializable {
+    uint256 public ethBalance;
+    uint256 public tokenBalance;
+    uint256 public feeBasisPoints;
+    uint256 public lastMint;
+    uint256 public interval = 1 hours;
+    uint256 public mintAmount = 37000 * 10**decimals();
+    uint256 public mintDuration = 37 weeks;
+    IOracle[] public oracles;
+
+    mapping(address => uint256) public userLiquidityBalances;
+    uint256 public totalLiquidity;
+
+    event TokenSwapped(address indexed user, uint256 amountIn, uint256 amountOut);
+    event LiquidityProvided(address indexed user, uint256 amountProvided);
+    event TokensMinted(address indexed user, uint256 amountMinted);
+    event OracleAdded(address indexed oracle);
+    event OracleRemoved(address indexed oracle);
+
+    modifier onlyOwnerOrAdmin() {
+        require(msg.sender == owner() || hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "Caller is not the owner or admin");
+        _;
+    }
+
+    function initialize(uint256 _feeBasisPoints) public initializer {
+        __ERC20_init("FaucetToken", "FTK");
+        __ReentrancyGuard_init();
+        __Ownable_init();
+        __Pausable_init();
+
+        feeBasisPoints = _feeBasisPoints;
+        lastMint = block.timestamp;
+    }
+
+    function depositEth() public payable whenNotPaused {
+        ethBalance += msg.value;
+    }
+
+    function mintTokens() public onlyOwnerOrAdmin whenNotPaused {
+        require(block.timestamp >= lastMint + interval, "Too early to mint");
+        require(block.timestamp <= lastMint + mintDuration, "Minting period has ended");
+
+        lastMint = block.timestamp;
+        _mint(owner(), mintAmount);
+        tokenBalance += mintAmount;
+
+        emit TokensMinted(msg.sender, mintAmount);
+    }
+
+    function swapEthForTokens(uint256 minTokens) public payable nonReentrant whenNotPaused {
+        uint256 tokenAmount = getTokenAmount(msg.value);
+        uint256 fee = tokenAmount * feeBasisPoints / 10000;
+        tokenAmount -= fee;
+        require(tokenAmount >= minTokens, "Slippage limit exceeded");
+
+        ethBalance += msg.value;
+        tokenBalance -= tokenAmount;
+        _transfer(owner(), msg.sender, tokenAmount);
+
+        emit TokenSwapped(msg.sender, msg.value, tokenAmount);
+    }
+
+    function swapTokensForEth(uint256 tokenAmount, uint256 minEth) public nonReentrant whenNotPaused {
+        _transfer(msg.sender, address(this), tokenAmount);
+        uint256 ethAmount = getEthAmount(tokenAmount);
+        uint256 fee = ethAmount * feeBasisPoints / 10000;
+        ethAmount -= fee;
+        require(ethAmount >= minEth, "Slippage limit exceeded");
+
+        ethBalance -= ethAmount;
+        tokenBalance += tokenAmount;
+        payable(msg.sender).transfer(ethAmount);
+
+        emit TokenSwapped(msg.sender, tokenAmount, ethAmount);
+    }
+
+    function provideLiquidity(uint256 ethAmount, uint256 tokenAmount) external payable nonReentrant whenNotPaused {
+        require(msg.value == ethAmount, "ETH amount mismatch");
+        _transfer(msg.sender, address(this), tokenAmount);
+
+        uint256 liquidity = calculateLiquidity(ethAmount, tokenAmount);
+        userLiquidityBalances[msg.sender] += liquidity;
+        totalLiquidity += liquidity;
+
+        ethBalance += ethAmount;
+        tokenBalance += tokenAmount;
+
+        emit LiquidityProvided(msg.sender, liquidity);
+    }
+
+    function withdrawLiquidity(uint256 liquidity, uint256 minEth, uint256 minTokens) external nonReentrant whenNotPaused {
+        require(liquidity <= userLiquidityBalances[msg.sender], "Insufficient liquidity");
+
+        uint256 ethAmount = liquidity * ethBalance / totalLiquidity;
+        uint256 tokenAmount = liquidity * tokenBalance / totalLiquidity;
+
+        require(ethAmount >= minEth && tokenAmount >= minTokens, "Slippage limit exceeded");
+
+        userLiquidityBalances[msg.sender] -= liquidity;
+        totalLiquidity -= liquidity;
+
+        ethBalance -= ethAmount;
+        tokenBalance -= tokenAmount;
+
+        payable(msg.sender).transfer(ethAmount);
+        _transfer(address(this), msg.sender, tokenAmount);
+    }
+
+    function withdrawFees() public onlyOwnerOrAdmin {
+        uint256 tokenFees = tokenBalance * feeBasisPoints / 10000;
+        uint256 ethFees = ethBalance * feeBasisPoints / 10000;
+
+        tokenBalance -= tokenFees;
+        ethBalance -= ethFees;
+
+        _transfer(address(this), owner(), tokenFees);
+        payable(owner()).transfer(ethFees);
+    }
+
+    function setFeeBasisPoints(uint256 _newFee) public onlyOwnerOrAdmin {
+        feeBasisPoints = _newFee;
+    }
+
+    function addOracle(address _oracle) public onlyOwnerOrAdmin {
+        oracles.push(IOracle(_oracle));
+        emit OracleAdded(_oracle);
+    }
+
+    function removeOracle(uint256 _index) public onlyOwnerOrAdmin {
+        require(_index < oracles.length, "Invalid oracle index");
+        address oracleAddress = address(oracles[_index]);
+        oracles[_index] = oracles[oracles.length - 1];
+        oracles.pop();
+        emit OracleRemoved(oracleAddress);
+    }
+
+    function pause() public onlyOwner {
+        _pause();
+    }
+
+    function unpause() public onlyOwner {
+        _unpause();
+    }
+
+    function getTokenAmount(uint256 _ethAmount) internal view returns (uint256) {
+        uint256 totalPrice = 0;
+        for (uint256 i = 0; i < oracles.length; i++) {
+            totalPrice += oracles[i].getPrice(address(this));
+        }
+        uint256 averagePrice = totalPrice / oracles.length;
+        return _ethAmount * tokenBalance / (ethBalance * averagePrice);
+    }
+
+    function getEthAmount(uint256 _tokenAmount) internal view returns (uint256) {
+        uint256 totalPrice = 0;
+        for (uint256 i = 0; i < oracles.length; i++) {
+            totalPrice += oracles[i].getPrice(address(this));
+        }
+        uint256 averagePrice = totalPrice / oracles.length;
+        return _tokenAmount * ethBalance / (tokenBalance * averagePrice);
+    }
+
+    function calculateLiquidity(uint256 _ethAmount, uint256 _tokenAmount) internal view returns (uint256) {
+        // Calculate the liquidity based on the provided ETH and token amounts
+        // using a formula that incentivizes liquidity provision
+        // ...
+        return _ethAmount + _tokenAmount;
+    }
+
+    receive() external payable {}
+}
